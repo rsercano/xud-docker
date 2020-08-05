@@ -1,7 +1,8 @@
 import logging
 import shlex
 import traceback
-import os
+import socket
+import threading
 
 from .config import Config, ConfigLoader
 from .shell import Shell
@@ -13,6 +14,12 @@ from .close_other_utils import Action as CloseOtherUtilsAction
 from .auto_unlock import Action as AutoUnlockAction
 from .warm_up import Action as WarmUpAction
 from .errors import FatalError, ConfigError, ConfigErrorScope
+
+
+INIT_SCRIPT = """\
+export PS1="{}"
+alias help=date
+"""
 
 
 def init_logging():
@@ -32,16 +39,15 @@ init_logging()
 
 
 class XudEnv:
-    def __init__(self, config, shell):
+    def __init__(self, config):
         self.logger = logging.getLogger("launcher.XudEnv")
 
         self.config = config
-        self.shell = shell
 
         self.node_manager = NodeManager(config, shell)
 
     def delegate_cmd_to_xucli(self, cmd):
-        self.node_manager.get_node("xud").cli(cmd, self.shell)
+        self.node_manager.get_node("xud").cli(cmd)
 
     def command_report(self):
         network_dir = f"{self.config.home_dir}/{self.config.network}"
@@ -127,7 +133,7 @@ your issue.""")
         AutoUnlockAction(self.node_manager).execute()
 
     def close_other_utils(self):
-        CloseOtherUtilsAction(self.config.network, self.shell).execute()
+        CloseOtherUtilsAction(self.config.network).execute()
 
     def warm_up(self):
         WarmUpAction(self.node_manager).execute()
@@ -143,18 +149,67 @@ your issue.""")
 
         self.close_other_utils()
 
-    def start(self):
-        up_env = True
+    def _handle_data(self, conn, data):
         try:
-            up_env = self.node_manager.update()
-        except ParallelExecutionError:
-            pass
+            line = data.decode().strip()
+            args = shlex.split(line)
+            if args[0] == "status":
+                self.node_manager.status2(conn)
+            elif args[0] == "report":
+                conn.send("report command")
+            elif args[0] == "logs":
+                conn.send("logs command")
+            elif args[0] == "start":
+                conn.send("start command")
+            elif args[0] == "stop":
+                conn.send("stop command")
+            elif args[0] == "restart":
+                conn.send("restart command")
+            elif args[0] == "up":
+                conn.send("up command\n")
+            elif args[0] == "down":
+                conn.send("down command\n")
+            else:
+                conn.send("command not found\n")
+        except:
+            self.logger.exception("Failed to handle data")
+            reply = traceback.format_exc()
+            conn.send(reply.encode())
 
-        if up_env:
-            self.node_manager.up()
-            self.pre_start()
+    def _start_server(self, sock):
+        socket_file = "./launcher.sock"
+        sock.bind(socket_file)
+        sock.listen(1)
+        try:
+            while True:
+                self.logger.debug("waiting for connection")
+                conn, client_addr = sock.accept()
+                self.logger.debug("new connection %s %s", conn, client_addr)
+                try:
+                    data = conn.recv(1024)
+                    self._handle_data(conn, data)
+                finally:
+                    conn.close()
+        except:
+            self.logger.exception("Server thread exception")
+        self.logger.debug("Server thread end")
 
-        self.shell.start(f"{self.config.network} > ", self.handle_command)
+    def _start_server_thread(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        t = threading.Thread(target=self._start_server, args=(sock,))
+        t.start()
+        return t, sock
+
+    def start(self):
+        self.node_manager.export()
+
+        self.node_manager.update()
+        self.node_manager.up()
+        self.pre_start()
+
+        t, sock = self._start_server_thread()
+        Shell(self.config).start()
+        sock.shutdown(socket.SHUT_RDWR)
 
 
 class Launcher:
@@ -163,13 +218,10 @@ class Launcher:
         self.logfile = None
 
     def launch(self):
-        shell = Shell()
         config = None
         try:
             config = Config(ConfigLoader())
-            assert config.network_dir is not None
-            shell.set_network_dir(config.network_dir)  # will create shell history file in network_dir
-            env = XudEnv(config, shell)
+            env = XudEnv(config)
             env.start()
         except KeyboardInterrupt:
             print()
@@ -191,6 +243,4 @@ class Launcher:
         except Exception:  # exclude system exceptions like SystemExit
             self.logger.exception("Unexpected exception during launching")
             traceback.print_exc()
-        finally:
-            shell.stop()
 

@@ -1,10 +1,10 @@
-import functools
 import logging
 import os
 import sys
 import threading
 import time
 from dataclasses import dataclass
+from typing import Dict
 
 import docker
 from docker.errors import NotFound
@@ -21,10 +21,14 @@ from .image import Image, ImageManager
 from .lnd import Lndbtc, Lndltc
 from .webui import Webui
 from .xud import Xud, XudApiError
+from .update import UpdateManager
 from ..config import Config
-from ..errors import FatalError
 from ..shell import Shell
 from ..utils import parallel_execute, get_useful_error_message, get_hostfs_file, ArgumentParser
+
+
+UPDATE_PROMPT = "A new version is available. Would you like to upgrade \
+(Warning: this may restart your environment and cancel all open orders)?"
 
 
 class LogsCommand:
@@ -110,7 +114,9 @@ class NodeManager:
         self.config = config
         self.shell = shell
         self.client = docker.from_env()
+
         self.image_manager = ImageManager(self.config, self.shell, self.client)
+        self.update_manager = UpdateManager(self.image_manager, self)
 
         self.branch = self.config.branch
         self.network = self.config.network
@@ -219,95 +225,15 @@ class NodeManager:
         diff_keys = [key for key, value in details.items() if not value.same]
         return ", ".join(diff_keys)
 
-    def update(self) -> bool:
+    def update(self) -> None:
         if self.config.disable_update:
-            return True
+            return
 
-        outdated = False
-        image_outdated = False
-
-        # Step 1. check all images
-        print("🌍 Checking for updates...")
-        images = self.image_manager.check_for_updates()
-
-        self.logger.debug("[Update] Image checking result: %r", images)
-
-        # TODO handle image local status. Print a warning or give users a choice
-        for image in images:
-            status = image.status
-            if status in ["LOCAL_MISSING", "LOCAL_OUTDATED"]:
-                print("- Image %s: %s" % (image.name, image.status_message))
-                outdated = True
-                image_outdated = True
-            elif status == "UNAVAILABLE":
-                all_unavailable_images = [x for x in images if x.status == "UNAVAILABLE"]
-                raise FatalError("Image(s) not available: %r" % all_unavailable_images)
-
-        # Step 2. check all containers
-        containers = self.nodes.values()
-        container_check_result = {c: None for c in containers}
-
-        def print_failed(failed):
-            print("Failed to check for container updates.")
-            for container, error in failed:
-                print("- {}: {}".format(container.name, get_useful_error_message(error)))
-
-        def try_again():
-            answer = self.shell.yes_or_no("Try again?")
-            return answer == "yes"
-
-        def handle_result(container, result):
-            container_check_result[container] = result
-
-        parallel_execute(containers, lambda c: c.check_for_updates(), 60, print_failed, try_again, handle_result)
-
-        self.logger.debug("[Update] Container checking result: %r", container_check_result)
-
-        for container, result in container_check_result.items():
-            status, details = result
-            # when mode internal -> external or others, status will be "external_with_container"
-            # when mode external or others -> internal, status will be "missing" because we deleted the container before
-            # when disabled False -> True, status will be "disabled_with_container"
-            # when disabled True -> False, status will be "missing" because we deleted the container before
-            if status in ["missing", "outdated", "external_with_container", "disabled_with_container"]:
-                readable_details = self._readable_details(details)
-                if readable_details:
-                    print("- Container %s: %s (%s)" % (container.container_name, self._display_container_status_text(status), readable_details))
-                else:
-                    print("- Container %s: %s" % (container.container_name, self._display_container_status_text(status)))
-                outdated = True
-
-        if not outdated:
-            print("All up-to-date.")
-            return True
-
-        all_containers_missing = functools.reduce(lambda a, b: a and b[0] in ["missing", "external", "disabled"], container_check_result.values(), True)
-
-        if all_containers_missing:
-            if self.newly_installed:
-                answer = "yes"
-            else:
-                if image_outdated:
-                    answer = "yes"
-                else:
-                    return True  # FIXME unintended containers (configuration) update
-        else:
-            answer = self.shell.yes_or_no("A new version is available. Would you like to upgrade (Warning: this may restart your environment and cancel all open orders)?")
-
-        if answer == "yes":
-            # Step 1. update images
-            self.image_manager.update_images()
-
-            # Step 2. update containers
-            # 2.1) stop all running containers
-            for container in containers:
-                container.stop()
-            # 2.2) recreate outdated containers
-            for container, result in container_check_result.items():
-                container.update(result)
-            return True
-        else:
-            return False
+        updates = self.update_manager.check_for_updates()
+        if updates:
+            reply = self.shell.yes_or_no(UPDATE_PROMPT)
+            if reply == "yes":
+                self.update_manager.apply(updates)
 
     def logs(self, *args):
         self.cmd_logs.execute(args)
@@ -424,6 +350,15 @@ class NodeManager:
 
         stop_fetching_animation.set()
 
+    def status2(self, conn) -> None:
+        services = self.enabled_nodes
+        for name, service in services.items():
+            line = "{}: {}\n".format(name, service.status())
+            conn.send(line.encode())
+
     @property
     def newly_installed(self):
         return not os.path.exists(f"{get_hostfs_file(self.config.network_dir)}/data/xud/nodekey.dat")
+
+    def export(self) -> str:
+        return "exported docker-compose.yml"

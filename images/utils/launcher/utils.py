@@ -96,3 +96,19 @@ class ArgumentParser(argparse.ArgumentParser):
 
     def error(self, message):
         raise ArgumentError(message, self.format_usage())
+
+
+def yes_or_no(prompt, default="yes"):
+    assert default in ["yes", "no"]
+    if default == "yes":
+        prompt += " [Y/n]"
+    else:
+        prompt += " [y/N]"
+
+    while True:
+        reply = input(prompt)
+        reply = reply.strip().lower()
+        if reply == "":
+            reply = default
+        if reply in ["yes", "no"]:
+            return reply

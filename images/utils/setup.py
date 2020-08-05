@@ -8,6 +8,6 @@ setup(
     include_package_data=True,
     package_data={
         "launcher.config": ["*.conf", "nodes.json"],
-        "launcher.shell": ["banner.txt"],
+        "launcher.shell": ["banner.txt", "profile.ash"],
     }
 )
