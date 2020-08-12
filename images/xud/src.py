@@ -10,3 +10,6 @@ class SourceManager(src.SourceManager):
         return {
             "GIT_REVISION": revision[:8]
         }
+
+    def get_ref(self, version):
+        return "replace-order-packet"
