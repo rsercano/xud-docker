@@ -10,3 +10,7 @@ class SourceManager(src.SourceManager):
         return {
             "GIT_REVISION": revision[:8]
         }
+    
+    def get_ref(self, version):
+        return "be041a404b21aa0b004201ec55a6927edfba406f"
+#
